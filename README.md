@@ -33,19 +33,19 @@ chmod +x git-sync
 
 ### Examples
 
-**Basic synchronization (running from the destination directory):**
+**Basic synchronization:**
 ```bash
-cd ./main-branch && ../git-sync ../feat-branch .
+./git-sync ./feat-branch ./main-branch
 ```
 
 **Run a command while syncing:**
 ```bash
-cd ./main-branch && ../git-sync ../feat-branch . "npm run dev"
+./git-sync ./feat-branch ./main-branch "cd ./main-branch && npm run dev"
 ```
 
 **Complex shell commands:**
 ```bash
-cd ./main-branch && ../git-sync ../feat-branch . "make | tee build.log"
+./git-sync ./feat-branch ./main-branch "cd ./main-branch && make | tee build.log"
 ```
 
 ## How It Works (Principles)
