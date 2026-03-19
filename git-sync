@@ -72,17 +72,19 @@ def main():
 
     # State management
     wrapper_proc = None
+    observer = None
     exit_status = 0
 
     def signal_handler(sig, frame):
-        nonlocal exit_status
+        nonlocal exit_status, observer
         if sig == signal.SIGUSR1:
             print("\nFATAL ERROR: sync conflict detected. Terminating...")
             exit_status = 1
         else:
             print("\nStopping sync...")
         
-        observer.stop()
+        if observer:
+            observer.stop()
         if wrapper_proc:
             try:
                 # Terminate the entire process group
