@@ -6,9 +6,11 @@ A lightweight utility to real-time synchronize changes from one Git worktree to 
 
 - **Real-time Sync**: Uses `watchdog` (inotify/FSEvents) to monitor file changes.
 - **Git-Aware**: Automatically respects `.gitignore` in both source and destination.
+- **Fatal on Conflict**: If a file is unignored in the source but ignored in the destination, the script exits immediately with an error and cleans up the destination.
 - **Safety First**: Verifies that both directories belong to the same Git repository before starting.
 - **Auto-Cleanup**: Automatically performs `git reset --hard` and `git clean -fd` on the destination directory upon startup and exit.
 - **Wrapper Mode**: Can execute a command (e.g., a build script or dev server) and keep syncing until the command finishes or is interrupted.
+- **Robust Process Management**: When a fatal error occurs or the user interrupts, it forcefully kills the child process and its entire process group before cleaning up.
 - **Shell Support**: Supports complex shell commands (pipes, redirections, heredocs) when wrapped in quotes.
 
 ## Installation
@@ -31,19 +33,19 @@ chmod +x git-sync
 
 ### Examples
 
-**Basic synchronization:**
+**Basic synchronization (running from the destination directory):**
 ```bash
-./git-sync ./feat-branch ./main-branch
+cd ./main-branch && ../git-sync ../feat-branch .
 ```
 
 **Run a command while syncing:**
 ```bash
-./git-sync ./feat-branch ./main-branch "npm run dev"
+cd ./main-branch && ../git-sync ../feat-branch . "npm run dev"
 ```
 
 **Complex shell commands:**
 ```bash
-./git-sync ./feat-branch ./main-branch "make | tee build.log"
+cd ./main-branch && ../git-sync ../feat-branch . "make | tee build.log"
 ```
 
 ## How It Works (Principles)
@@ -57,17 +59,17 @@ chmod +x git-sync
    - Starts a background observer using the `watchdog` library.
    - Monitors for `created`, `modified`, `deleted`, and `moved` events in the `<src>` directory.
 
-3. **Filtering**:
+3. **Filtering & Fatal Errors**:
    - For every change, it checks `git check-ignore`. 
    - Files ignored in `<src>` are skipped.
-   - If a file is unignored in `<src>` but ignored in `<dest>`, it prints a fatal error (but continues monitoring other files) to prevent accidental overwrites of destination-specific ignored files.
+   - **Fatal Logic**: If a file is unignored in `<src>` but ignored in `<dest>`, the script prints a `FATAL ERROR`, stops the observer, kills any running wrapper command (including its entire process group), performs final cleanup on `<dest>`, and exits with code `1`.
 
 4. **Execution**:
-   - If a command is provided, it runs it in a subshell (`shell=True`).
+   - If a command is provided, it runs it in a subshell (`shell=True`) within its own process group (`start_new_session=True`).
    - The script waits for the command to finish.
 
 5. **Cleanup**:
-   - On exit (due to command completion or signals like `Ctrl+C`), it stops the observer and restores the `<dest>` directory to its original Git state using `git reset --hard` and `git clean -fd`.
+   - On exit (due to fatal error, command completion, or signals like `Ctrl+C`), it stops the observer, terminates child processes, and restores the `<dest>` directory to its original Git state using `git reset --hard` and `git clean -fd`.
 
 ## Requirements
 

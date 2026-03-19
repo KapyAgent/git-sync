@@ -29,25 +29,6 @@ def cleanup_dest(dest):
     run_git(["reset", "--hard", "HEAD"], cwd=dest)
     run_git(["clean", "-fd"], cwd=dest)
 
-def sync_path(src_path, src_root, dest_root):
-    rel_path = os.path.relpath(src_path, src_root)
-    dest_path = os.path.join(dest_root, rel_path)
-
-    if os.path.isdir(src_path):
-        if not os.path.exists(dest_path):
-            os.makedirs(dest_path, exist_ok=True)
-        return
-
-    if is_ignored(rel_path, src_root):
-        return
-
-    if is_ignored(rel_path, dest_root):
-        print(f"FATAL: {rel_path} is ignored in destination {dest_root}. Aborting sync for this file.")
-        return
-
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    shutil.copy2(src_path, dest_path)
-
 def remove_path(src_path, src_root, dest_root):
     rel_path = os.path.relpath(src_path, src_root)
     dest_path = os.path.join(dest_root, rel_path)
@@ -56,25 +37,6 @@ def remove_path(src_path, src_root, dest_root):
             shutil.rmtree(dest_path)
         else:
             os.remove(dest_path)
-
-class SyncHandler(FileSystemEventHandler):
-    def __init__(self, src_root, dest_root):
-        self.src_root = src_root
-        self.dest_root = dest_root
-
-    def on_modified(self, event):
-        if not event.is_directory:
-            sync_path(event.src_path, self.src_root, self.dest_root)
-
-    def on_created(self, event):
-        sync_path(event.src_path, self.src_root, self.dest_root)
-
-    def on_deleted(self, event):
-        remove_path(event.src_path, self.src_root, self.dest_root)
-
-    def on_moved(self, event):
-        remove_path(event.src_path, self.src_root, self.dest_root)
-        sync_path(event.dest_path, self.src_root, self.dest_root)
 
 def main():
     parser = argparse.ArgumentParser(description="Sync git worktree changes from src to dest.")
@@ -99,57 +61,102 @@ def main():
 
     cleanup_dest(dest)
 
+    # State management
+    wrapper_proc = None
+    exit_status = 0
+
+    def signal_handler(sig, frame):
+        nonlocal exit_status
+        if sig == signal.SIGUSR1:
+            print("\nFATAL ERROR: sync conflict detected. Terminating...")
+            exit_status = 1
+        else:
+            print("\nStopping sync...")
+        
+        observer.stop()
+        if wrapper_proc:
+            try:
+                # Terminate the entire process group
+                pgid = os.getpgid(wrapper_proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                time.sleep(0.5)
+                if wrapper_proc.poll() is None:
+                    os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        
+        cleanup_dest(dest)
+        sys.exit(exit_status)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGHUP, signal_handler)
+    signal.signal(signal.SIGUSR1, signal_handler)
+
+    def safe_sync(path, s_root, d_root):
+        rel_path = os.path.relpath(path, s_root)
+        if is_ignored(rel_path, s_root):
+            return
+        if is_ignored(rel_path, d_root):
+            print(f"\nFATAL: {rel_path} is ignored in destination {d_root}. Aborting.")
+            os.kill(os.getpid(), signal.SIGUSR1)
+            return
+        
+        dest_path = os.path.join(d_root, rel_path)
+        if os.path.isdir(path):
+            os.makedirs(dest_path, exist_ok=True)
+        else:
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            shutil.copy2(path, dest_path)
+
     print(f"Performing initial sync from {src} to {dest}...")
     for root, dirs, files in os.walk(src):
         if '.git' in dirs:
             dirs.remove('.git')
         for d in dirs:
-            sync_path(os.path.join(root, d), src, dest)
+            safe_sync(os.path.join(root, d), src, dest)
         for f in files:
-            sync_path(os.path.join(root, f), src, dest)
+            safe_sync(os.path.join(root, f), src, dest)
 
-    event_handler = SyncHandler(src, dest)
+    class SyncHandler(FileSystemEventHandler):
+        def on_modified(self, event):
+            if not event.is_directory:
+                safe_sync(event.src_path, src, dest)
+        def on_created(self, event):
+            safe_sync(event.src_path, src, dest)
+        def on_deleted(self, event):
+            remove_path(event.src_path, src, dest)
+        def on_moved(self, event):
+            remove_path(event.src_path, src, dest)
+            safe_sync(event.dest_path, src, dest)
+
     observer = Observer()
-    observer.schedule(event_handler, src, recursive=True)
+    observer.schedule(SyncHandler(), src, recursive=True)
     observer.start()
-
-    wrapper_proc = None
-
-    def signal_handler(sig, frame):
-        print("\nStopping sync...")
-        observer.stop()
-        if wrapper_proc:
-            wrapper_proc.terminate()
-        cleanup_dest(dest)
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGHUP, signal_handler)
 
     cmd_list = args.cmd
     if cmd_list:
-        # We join the command parts with spaces.
-        # For complex commands (with pipes, redirections, or spaces in arguments),
-        # it is best to wrap the entire command in quotes.
         cmd_string = " ".join(cmd_list)
         print(f"Running command: {cmd_string}")
-        wrapper_proc = subprocess.Popen(cmd_string, shell=True)
+        # Use start_new_session to ensure we can kill the whole group
+        wrapper_proc = subprocess.Popen(cmd_string, shell=True, start_new_session=True)
         try:
             while wrapper_proc.poll() is None:
                 time.sleep(0.5)
+            if exit_status == 0:
+                exit_status = wrapper_proc.returncode
             print(f"Command exited with code {wrapper_proc.returncode}")
         except KeyboardInterrupt:
             pass
         finally:
-            signal_handler(None, None)
+            signal_handler(signal.SIGINT, None)
     else:
         print("Syncing... Press Ctrl+C to stop.")
         try:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
-            signal_handler(None, None)
+            signal_handler(signal.SIGINT, None)
 
 if __name__ == "__main__":
     main()
