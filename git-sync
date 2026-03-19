@@ -52,11 +52,20 @@ def main():
         print("Error: src and dest must be directories.")
         sys.exit(1)
 
-    src_common = run_git(["rev-parse", "--git-common-dir"], src).stdout.strip()
-    dest_common = run_git(["rev-parse", "--git-common-dir"], dest).stdout.strip()
+    # Ensure src and dest belong to the same git repository
+    src_common_raw = run_git(["rev-parse", "--git-common-dir"], src).stdout.strip()
+    dest_common_raw = run_git(["rev-parse", "--git-common-dir"], dest).stdout.strip()
 
-    if not src_common or src_common != dest_common:
-        print("Error: src and dev must belong to the same git repository.")
+    if not src_common_raw or not dest_common_raw:
+        print("Error: Could not find git common directory for src or dest.")
+        sys.exit(1)
+
+    # Convert to absolute paths to avoid relative path comparison issues
+    src_common = os.path.abspath(os.path.join(src, src_common_raw))
+    dest_common = os.path.abspath(os.path.join(dest, dest_common_raw))
+
+    if src_common != dest_common:
+        print(f"Error: src and dest must belong to the same git repository.\nSrc common: {src_common}\nDest common: {dest_common}")
         sys.exit(1)
 
     cleanup_dest(dest)
@@ -82,7 +91,7 @@ def main():
                 time.sleep(0.5)
                 if wrapper_proc.poll() is None:
                     os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+            except (ProcessLookupError, PermissionError, OSError):
                 pass
         
         cleanup_dest(dest)
@@ -109,14 +118,43 @@ def main():
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
             shutil.copy2(path, dest_path)
 
+    # Initial Sync Logic: Batch files to sync
     print(f"Performing initial sync from {src} to {dest}...")
-    for root, dirs, files in os.walk(src):
-        if '.git' in dirs:
-            dirs.remove('.git')
-        for d in dirs:
-            safe_sync(os.path.join(root, d), src, dest)
-        for f in files:
-            safe_sync(os.path.join(root, f), src, dest)
+    
+    # 1. Get all files to sync from src (cached + others - ignored)
+    ls_files_res = run_git(["ls-files", "--cached", "--others", "--exclude-standard", "-z"], src)
+    if ls_files_res.returncode != 0:
+        print("Error: Failed to list files in source.")
+        sys.exit(1)
+        
+    files_to_sync = [f for f in ls_files_res.stdout.split('\0') if f]
+    
+    # 2. Check if any of these files are ignored in dest (batch check)
+    if files_to_sync:
+        check_ignore_res = subprocess.run(
+            ["git", "check-ignore", "--stdin", "-z"],
+            cwd=dest, input='\0'.join(files_to_sync), capture_output=True, text=True
+        )
+        ignored_in_dest = [f for f in check_ignore_res.stdout.split('\0') if f]
+        
+        if ignored_in_dest:
+            print(f"\nFATAL: The following files are ignored in destination {dest}. Aborting.")
+            for f in ignored_in_dest:
+                print(f"  {f}")
+            cleanup_dest(dest)
+            sys.exit(1)
+
+        # 3. Perform Sync (Copy files)
+        for rel_path in files_to_sync:
+            src_path = os.path.join(src, rel_path)
+            dest_path = os.path.join(dest, rel_path)
+            if os.path.isdir(src_path):
+                os.makedirs(dest_path, exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                shutil.copy2(src_path, dest_path)
+
+    print("Initial sync completed.")
 
     class SyncHandler(FileSystemEventHandler):
         def on_modified(self, event):
