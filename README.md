@@ -12,7 +12,6 @@ A lightweight utility to real-time synchronize changes from one Git worktree to 
 - **Wrapper Mode**: Can execute a command (e.g., a build script or dev server) and keep syncing until the command finishes or is interrupted.
 - **Robust Process Management**: When a fatal error occurs or the user interrupts, it forcefully kills the child process and its entire process group before cleaning up.
 - **Shell Support**: Supports complex shell commands (pipes, redirections, heredocs) when wrapped in quotes.
-- **Efficient Initialization**: Uses `git ls-files` for fast initial synchronization (v3+).
 
 ## Installation
 
@@ -22,6 +21,8 @@ Ensure you have [uv](https://github.com/astral-sh/uv) installed.
 git clone https://github.com/KapyAgent/git-sync.git
 cd git-sync
 chmod +x git-sync
+# Optional: Add to your PATH
+# export PATH="$PATH:$(pwd)"
 ```
 
 ## Usage
@@ -52,8 +53,7 @@ cd ./main-branch && ../git-sync ../feat-branch . "make | tee build.log"
 1. **Initialization**:
    - Validates that `<src>` and `<dest>` are directories and share the same Git common directory.
    - Performs an initial cleanup of the `<dest>` directory to ensure a clean state.
-   - **Batch Sync**: Executes an initial recursive sync of all non-ignored files from `<src>` to `<dest>` using `git ls-files` and `shutil.copy2` for maximum performance.
-   - Prints "Initial sync completed." upon success.
+   - Executes an initial recursive sync of all non-ignored files from `<src>` to `<dest>`.
 
 2. **Monitoring**:
    - Starts a background observer using the `watchdog` library.
