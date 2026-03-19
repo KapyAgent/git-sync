@@ -129,11 +129,9 @@ def main():
 
     cmd_list = args.cmd
     if cmd_list:
-        # Join the command pieces back into a single string to be interpreted by the shell.
-        # This allows things like: git-sync src dest "cat <<EOF\nhello\nEOF"
-        # Or even: git-sync src dest cat '<<EOF' 'hello' 'EOF' (though less common)
-        # Using shlex.join or simple space join. shlex.join is safer for array to shell string conversion.
-        import shlex
+        # We join the command parts with spaces.
+        # For complex commands (with pipes, redirections, or spaces in arguments),
+        # it is best to wrap the entire command in quotes.
         cmd_string = " ".join(cmd_list)
         print(f"Running command: {cmd_string}")
         wrapper_proc = subprocess.Popen(cmd_string, shell=True)
