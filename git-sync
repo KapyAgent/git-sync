@@ -1,0 +1,174 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "watchdog",
+# ]
+# ///
+
+import os
+import sys
+import subprocess
+import shutil
+import signal
+import time
+import argparse
+from pathlib import Path
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+def run_git(args, cwd):
+    return subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True)
+
+def is_ignored(path, root):
+    # Check if path is ignored in the given root
+    res = run_git(["check-ignore", "-q", str(path)], cwd=root)
+    return res.returncode == 0
+
+def cleanup_dest(dest):
+    print(f"Cleaning up {dest}...")
+    run_git(["reset", "--hard", "HEAD"], cwd=dest)
+    run_git(["clean", "-fd"], cwd=dest)
+
+def sync_path(src_path, src_root, dest_root):
+    rel_path = os.path.relpath(src_path, src_root)
+    dest_path = os.path.join(dest_root, rel_path)
+
+    if os.path.isdir(src_path):
+        if not os.path.exists(dest_path):
+            os.makedirs(dest_path, exist_ok=True)
+        return
+
+    # Check if ignored in src
+    if is_ignored(rel_path, src_root):
+        return
+
+    # Check if ignored in dest (fatal error if it is)
+    if is_ignored(rel_path, dest_root):
+        print(f"FATAL: {rel_path} is ignored in destination {dest_root}. Aborting sync for this file.")
+        # We don't exit the whole program, just skip this file to avoid breaking dest's ignore rules
+        return
+
+    # Sync file
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    shutil.copy2(src_path, dest_path)
+    # print(f"Synced: {rel_path}")
+
+def remove_path(src_path, src_root, dest_root):
+    rel_path = os.path.relpath(src_path, src_root)
+    dest_path = os.path.join(dest_root, rel_path)
+    
+    if os.path.exists(dest_path):
+        if os.path.isdir(dest_path):
+            shutil.rmtree(dest_path)
+        else:
+            os.remove(dest_path)
+        # print(f"Removed: {rel_path}")
+
+class SyncHandler(FileSystemEventHandler):
+    def __init__(self, src_root, dest_root):
+        self.src_root = src_root
+        self.dest_root = dest_root
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            sync_path(event.src_path, self.src_root, self.dest_root)
+
+    def on_created(self, event):
+        sync_path(event.src_path, self.src_root, self.dest_root)
+
+    def on_deleted(self, event):
+        remove_path(event.src_path, self.src_root, self.dest_root)
+
+    def on_moved(self, event):
+        remove_path(event.src_path, self.src_root, self.dest_root)
+        sync_path(event.dest_path, self.src_root, self.dest_root)
+
+def main():
+    parser = argparse.ArgumentParser(description="Sync git worktree changes from src to dest.")
+    parser.add_argument("src", help="Source directory (feat branch)")
+    parser.add_argument("dest", help="Destination directory (main branch)")
+    parser.add_argument("--cmd", help="Optional command to run while syncing", nudge=None)
+    args, unknown = parser.parse_known_args()
+
+    src = os.path.abspath(args.src)
+    dest = os.path.abspath(args.dest)
+
+    if not os.path.isdir(src) or not os.path.isdir(dest):
+        print("Error: src and dest must be directories.")
+        sys.exit(1)
+
+    # 1. Check same git tree
+    src_common = run_git(["rev-parse", "--git-common-dir"], src).stdout.strip()
+    dest_common = run_git(["rev-parse", "--git-common-dir"], dest).stdout.strip()
+
+    if not src_common or src_common != dest_common:
+        print("Error: src and dest must belong to the same git repository.")
+        sys.exit(1)
+
+    # 2. Cleanup dest on startup
+    cleanup_dest(dest)
+
+    # 3. Initial sync (non-ignored files)
+    print(f"Performing initial sync from {src} to {dest}...")
+    for root, dirs, files in os.walk(src):
+        # Filter dirs (don't recurse into .git)
+        if '.git' in dirs:
+            dirs.remove('.git')
+        
+        for d in dirs:
+            sync_path(os.path.join(root, d), src, dest)
+        for f in files:
+            sync_path(os.path.join(root, f), src, dest)
+
+    # 4. Setup observer
+    event_handler = SyncHandler(src, dest)
+    observer = Observer()
+    observer.schedule(event_handler, src, recursive=True)
+    observer.start()
+
+    wrapper_proc = None
+
+    def signal_handler(sig, frame):
+        print("\nStopping sync...")
+        observer.stop()
+        if wrapper_proc:
+            wrapper_proc.terminate()
+        cleanup_dest(dest)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGHUP, signal_handler)
+
+    # 5. Run wrapper command if provided
+    # Join unknown args if --cmd was not used but extra args exist, or use --cmd
+    cmd_to_run = args.cmd
+    if not cmd_to_run and unknown:
+        # If user passed "git-sync src dest 'my command'", unknown will be ['my command']
+        # If user passed "git-sync src dest command args", unknown will be ['command', 'args']
+        cmd_to_run = " ".join(unknown)
+
+    if cmd_to_run:
+        print(f"Running command: {cmd_to_run}")
+        # Use shell=True to support backslashes and heredocs naturally
+        wrapper_proc = subprocess.Popen(cmd_to_run, shell=True)
+        
+        try:
+            while wrapper_proc.poll() is None:
+                time.sleep(1)
+            print(f"Command exited with code {wrapper_proc.returncode}")
+        except KeyboardInterrupt:
+            pass
+        finally:
+            signal_handler(None, None)
+    else:
+        print("Syncing... Press Ctrl+C to stop.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            signal_handler(None, None)
+
+if __name__ == "__main__":
+    main()
